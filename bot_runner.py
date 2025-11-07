@@ -141,6 +141,7 @@ class HeadlessBot:
         self.is_running = False
         self.message_task: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        self.message_loop_loop = None  # Store the event loop for sending stop message
         
         # Win/Loss counters
         self.total_wins = 0
@@ -355,21 +356,24 @@ class HeadlessBot:
             import traceback
             traceback.print_exc()
         finally:
-            if self.bot and self.is_running:
+            # Send stop message if bot exists (regardless of is_running status)
+            if self.bot:
                 try:
                     await self.send_telegram_message(self.translations['messages']['bot_stopped'])
                     self.log_activity('Bot stopped message sent')
-                except:
-                    pass
+                except Exception as e:
+                    self.log_activity(f'Failed to send stop message: {str(e)}')
             self.is_running = False
     
     def message_loop(self):
         """Main message loop running in background thread."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self.message_loop_loop = loop  # Store reference for stop() method
         try:
             loop.run_until_complete(self.async_message_loop())
         finally:
+            self.message_loop_loop = None
             loop.close()
     
     def start(self):
@@ -390,11 +394,43 @@ class HeadlessBot:
             self.is_running = False
             return False
     
+    def change_language(self, new_language: str):
+        """Change the bot's language dynamically."""
+        new_lang = new_language.lower()
+        if new_lang in TRANSLATIONS:
+            old_language = self.language
+            self.language = new_lang
+            self.translations = TRANSLATIONS[new_lang]
+            self.log_activity(f'Language changed from {old_language} to {new_lang}')
+            return True
+        return False
+    
     def stop(self):
         """Stop the bot."""
+        was_running = self.is_running
         self.is_running = False
         self.stop_event.set()
-        self.log_activity('Bot stopped')
+        self.log_activity('Bot stop requested')
+        
+        # If bot was running and we have a bot instance, try to send stop message immediately
+        # This ensures the message is sent even if the message loop hasn't reached the finally block yet
+        if was_running and self.bot and self.message_loop_loop:
+            try:
+                # Use the message loop's event loop to send the stop message
+                future = asyncio.run_coroutine_threadsafe(
+                    self.send_telegram_message(self.translations['messages']['bot_stopped']),
+                    self.message_loop_loop
+                )
+                # Wait up to 2 seconds for the message to be sent
+                future.result(timeout=2.0)
+                self.log_activity('Bot stopped message sent (from stop method)')
+            except Exception as e:
+                self.log_activity(f'Could not send stop message immediately: {str(e)}')
+                # The finally block in async_message_loop will try to send it
+        
+        # Wait for message thread to finish (with timeout)
+        if self.message_task and self.message_task.is_alive():
+            self.message_task.join(timeout=5.0)
 
 # HTML Template
 HTML_TEMPLATE = '''
@@ -698,8 +734,33 @@ HTML_TEMPLATE = '''
         }
         
         document.getElementById('language').addEventListener('change', (e) => {
-            currentLanguage = e.target.value;
+            const newLanguage = e.target.value;
+            currentLanguage = newLanguage;
             updateUI();
+            
+            // If bot is running, change its language dynamically
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.running) {
+                        fetch('/api/change-language', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({language: newLanguage})
+                        })
+                        .then(r => r.json())
+                        .then(result => {
+                            if (result.success) {
+                                addLog(`Language changed to ${newLanguage === 'en' ? 'English' : 'Portuguese'}`, 'success');
+                            } else {
+                                addLog('Failed to change language: ' + result.error, 'error');
+                            }
+                        })
+                        .catch(err => {
+                            addLog('Error changing language: ' + err.message, 'error');
+                        });
+                    }
+                });
         });
         
         // Update status and logs every 2 seconds
@@ -726,41 +787,47 @@ def api_start():
     """Start the bot."""
     global bot_instance
     
-    with bot_lock:
-        if bot_instance and bot_instance.is_running:
-            return jsonify({'success': False, 'error': 'Bot is already running'})
-        
-        data = request.json
-        bot_token = data.get('token', '').strip()
-        channel_id = data.get('channel_id', '').strip()
-        language = data.get('language', 'en').lower()
-        
-        if not bot_token:
-            return jsonify({'success': False, 'error': 'Bot token is required'})
-        if not channel_id:
-            return jsonify({'success': False, 'error': 'Channel ID is required'})
-        if len(bot_token) < 20:
-            return jsonify({'success': False, 'error': 'Invalid bot token format'})
-        
-        try:
+    try:
+        with bot_lock:
+            if bot_instance and bot_instance.is_running:
+                return jsonify({'success': False, 'error': 'Bot is already running'})
+            
+            if not request.json:
+                return jsonify({'success': False, 'error': 'Invalid request data'})
+            
+            data = request.json
+            bot_token = data.get('token', '').strip()
+            channel_id = data.get('channel_id', '').strip()
+            language = data.get('language', 'en').lower()
+            
+            if not bot_token:
+                return jsonify({'success': False, 'error': 'Bot token is required'})
+            if not channel_id:
+                return jsonify({'success': False, 'error': 'Channel ID is required'})
+            if len(bot_token) < 20:
+                return jsonify({'success': False, 'error': 'Invalid bot token format'})
+            
             bot_instance = HeadlessBot(bot_token, channel_id, language)
             if bot_instance.start():
                 return jsonify({'success': True})
             else:
                 return jsonify({'success': False, 'error': 'Failed to start bot'})
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
     """Stop the bot."""
     global bot_instance
     
-    with bot_lock:
-        if bot_instance:
-            bot_instance.stop()
-            bot_instance = None
-        return jsonify({'success': True})
+    try:
+        with bot_lock:
+            if bot_instance:
+                bot_instance.stop()
+                bot_instance = None
+            return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/api/status', methods=['GET'])
 def api_status():
@@ -785,6 +852,39 @@ def api_logs():
             return jsonify({'logs': bot_instance.activity_log})
         return jsonify({'logs': []})
 
+@app.route('/api/change-language', methods=['POST'])
+def api_change_language():
+    """Change the bot's language dynamically."""
+    global bot_instance
+    
+    try:
+        if not request.json:
+            return jsonify({'success': False, 'error': 'Invalid request data'})
+        
+        data = request.json
+        new_language = data.get('language', 'en').lower()
+        
+        if new_language not in TRANSLATIONS:
+            return jsonify({'success': False, 'error': f'Invalid language: {new_language}'})
+        
+        with bot_lock:
+            if bot_instance:
+                if bot_instance.change_language(new_language):
+                    return jsonify({'success': True, 'language': new_language})
+                else:
+                    return jsonify({'success': False, 'error': 'Failed to change language'})
+            else:
+                return jsonify({'success': False, 'error': 'Bot is not running'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint for Railway."""
+    return jsonify({'status': 'ok', 'service': 'bac-bo-bot'}), 200
+
 if __name__ == '__main__':
+    # Railway sets PORT environment variable
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Run on all interfaces (0.0.0.0) to accept external connections
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
